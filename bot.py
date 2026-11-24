@@ -38,6 +38,7 @@ TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/{method}"
 TELEGRAM_MESSAGE_LIMIT = 4096
 
 HTTP_TIMEOUT_SECONDS = LONG_POLL_WAIT_SECONDS + 10
+CONNECT_TIMEOUT_SECONDS = 10  # TCP + TLS: зависшее рукопожатие бросаем быстро, а не через 35 с
 RETRY_DELAY_SECONDS = 5
 
 NETWORK_ERRORS = (OSError, http.client.HTTPException, json.JSONDecodeError)
@@ -59,22 +60,73 @@ def http_json(url, *, query=None, form=None, timeout=HTTP_TIMEOUT_SECONDS):
         return json.load(response)
 
 
-def vk_call(method, token, **params):
-    payload = http_json(VK_API_URL + method, form={**params, "access_token": token, "v": VK_API_VERSION})
+class KeepAliveHttp:
+    """HTTPS-клиент, который держит соединения открытыми между запросами.
+
+    Каждое новое соединение — это TLS-рукопожатие, а на маршруте хостинг → ВК они периодически
+    зависают. Переиспользование соединений сокращает число рукопожатий в десятки раз.
+    Не потокобезопасен: у каждого потока свой экземпляр. Интерфейс как у http_json.
+    """
+
+    def __init__(self):
+        self._connections = {}
+
+    def request_json(self, url, *, query=None, form=None, timeout=HTTP_TIMEOUT_SECONDS):
+        parts = urllib.parse.urlsplit(url)
+        target = parts.path or "/"
+        if query:
+            target += f"?{urllib.parse.urlencode(query)}"
+        body = urllib.parse.urlencode(form).encode() if form is not None else None
+        try:
+            try:
+                return self._send(parts.netloc, target, body, timeout)
+            except (ConnectionResetError, BrokenPipeError):
+                # Сервер мог закрыть простаивавшее соединение — один раз повторяем на свежем.
+                return self._send(parts.netloc, target, body, timeout)
+        except NETWORK_ERRORS as error:
+            raise ConnectionError(f"{parts.netloc}: {error}") from error
+
+    def _send(self, host, target, body, timeout):
+        connection = self._connections.get(host)
+        if connection is None:
+            connection = self._connections[host] = http.client.HTTPSConnection(
+                host, timeout=CONNECT_TIMEOUT_SECONDS)
+        try:
+            if connection.sock is None:
+                connection.connect()  # рукопожатие идёт под коротким таймаутом
+            connection.sock.settimeout(timeout)
+            if body is None:
+                connection.request("GET", target)
+            else:
+                connection.request("POST", target, body=body,
+                                   headers={"Content-Type": "application/x-www-form-urlencoded"})
+            response = connection.getresponse()
+            payload = response.read()
+        except BaseException:
+            connection.close()  # следующее обращение откроет соединение заново
+            raise
+        if response.status != 200:
+            raise http.client.HTTPException(f"HTTP {response.status}")
+        return json.loads(payload)
+
+
+def vk_call(method, token, request_json=http_json, **params):
+    payload = request_json(VK_API_URL + method, form={**params, "access_token": token, "v": VK_API_VERSION})
     if "error" in payload:
         error = payload["error"]
         raise VkApiError(error.get("error_code"), error.get("error_msg"))
     return payload["response"]
 
 
-def fetch_group(token):
-    response = vk_call("groups.getById", token)
+def fetch_group(token, request_json=http_json):
+    response = vk_call("groups.getById", token, request_json)
     groups = response["groups"] if isinstance(response, dict) else response
     return {"id": groups[0]["id"], "name": groups[0]["name"]}
 
 
-def get_long_poll_server(token, group_id):
-    return vk_call("messages.getLongPollServer", token, group_id=group_id, lp_version=LONG_POLL_VERSION)
+def get_long_poll_server(token, group_id, request_json=http_json):
+    return vk_call("messages.getLongPollServer", token, request_json,
+                   group_id=group_id, lp_version=LONG_POLL_VERSION)
 
 
 def dialog_link(group_id, peer_id):
@@ -145,12 +197,13 @@ class CommunityListener(threading.Thread):
         self._notifier = notifier
         self._group = None
         self._ts = None  # переживает переподключения, чтобы не терять сообщения при сбоях сети
+        self._request_json = KeepAliveHttp().request_json
 
     def run(self):
         while True:
             try:
                 if self._group is None:
-                    self._group = fetch_group(self._token)
+                    self._group = fetch_group(self._token, self._request_json)
                     log.info("Слушаю «%s» (id %s)", self._group["name"], self._group["id"])
                 self._poll()
             except VkApiError as error:
@@ -169,11 +222,11 @@ class CommunityListener(threading.Thread):
         return f"«{self._group['name']}»" if self._group else self.name
 
     def _poll(self):
-        server = get_long_poll_server(self._token, self._group["id"])
+        server = get_long_poll_server(self._token, self._group["id"], self._request_json)
         if self._ts is None:
             self._ts = server["ts"]
         while True:
-            response = http_json(f"https://{server['server']}", query={
+            response = self._request_json(f"https://{server['server']}", query={
                 "act": "a_check", "key": server["key"], "ts": self._ts,
                 "wait": LONG_POLL_WAIT_SECONDS, "mode": 0, "version": LONG_POLL_VERSION,
             })
@@ -182,11 +235,11 @@ class CommunityListener(threading.Thread):
                 self._ts = response["ts"]
                 continue
             if failed == 2:  # истёк ключ — новый ключ, старый ts, чтобы не потерять события
-                server = get_long_poll_server(self._token, self._group["id"])
+                server = get_long_poll_server(self._token, self._group["id"], self._request_json)
                 continue
             if failed is not None:  # 3 — потеряна информация, 4 — неверная версия: начинаем заново
                 log.warning("%s: Long Poll вернул failed=%s, переподключаюсь", self._display_name(), failed)
-                server = get_long_poll_server(self._token, self._group["id"])
+                server = get_long_poll_server(self._token, self._group["id"], self._request_json)
                 self._ts = server["ts"]
                 continue
             self._forward_incoming(response.get("updates", []))
@@ -201,7 +254,7 @@ class CommunityListener(threading.Thread):
             return
         # Текст берём через API: в событии Long Poll он искажён HTML-экранированием.
         # extended=1 заодно возвращает профили отправителей — отдельный users.get не нужен.
-        response = vk_call("messages.getById", self._token,
+        response = vk_call("messages.getById", self._token, self._request_json,
                            message_ids=",".join(map(str, incoming_ids)), extended=1)
         names = {
             profile["id"]: f"{profile['first_name']} {profile['last_name']}"
